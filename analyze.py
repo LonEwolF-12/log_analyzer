@@ -275,6 +275,99 @@ def format_text(report: Report, top_n: int = 5) -> str:
     return "\n".join(rows)
 
 
+def _busiest_hour(report: Report) -> Optional[dict]:
+    """Return the busiest hour as a dict, or ``None`` when there is no timestamp data."""
+    if not report.hour_counts:
+        return None
+    hour, count = report.hour_counts.most_common(1)[0]
+    return {"hour": hour, "requests": count}
+
+
+def _to_dict(report: Report, top_n: int) -> dict:
+    """Build the machine-readable representation used by the JSON formatter."""
+    client_errors, server_errors = report.error_status_counts
+    return {
+        "sources": report.sources,
+        "lines_read": report.lines_read,
+        "parsed": report.parsed,
+        "unparseable": report.unparseable,
+        "error_keyword_lines": report.error_lines,
+        "total_bytes": report.total_bytes,
+        "parsed_ratio": round(report.parsed_ratio, 4),
+        "client_errors_4xx": client_errors,
+        "server_errors_5xx": server_errors,
+        "status_codes": {str(k): v for k, v in report.status_counts.most_common()},
+        "top_ips": [{"value": k, "count": v} for k, v in report.ip_counts.most_common(top_n)],
+        "top_paths": [{"value": k, "count": v} for k, v in report.path_counts.most_common(top_n)],
+        "top_methods": [{"value": k, "count": v} for k, v in report.method_counts.most_common(top_n)],
+        "busiest_hour": _busiest_hour(report),
+    }
+
+
+def format_json(report: Report, top_n: int = 5) -> str:
+    """Render the report as JSON, for piping into other tools or dashboards."""
+    return json.dumps(_to_dict(report, top_n), indent=2)
+
+
+def _markdown_table(title: str, counter: Counter, top_n: int) -> list[str]:
+    """Render one ranked 'Top N' table in Markdown."""
+    rows = [f"## {title}", "", "| Value | Count |", "| --- | ---: |"]
+    if not counter:
+        rows.append("| _(none)_ | 0 |")
+    for key, count in counter.most_common(top_n):
+        label = str(key) if str(key) else "_(empty)_"
+        rows.append(f"| `{label}` | {count:,} |")
+    rows.append("")
+    return rows
+
+
+def format_markdown(report: Report, top_n: int = 5) -> str:
+    """Render the report as Markdown, handy for pasting into an issue or PR."""
+    client_errors, server_errors = report.error_status_counts
+    lines = [
+        "# Log Analysis Report",
+        "",
+        f"**Sources:** {', '.join(report.sources)}",
+        "",
+        "| Metric | Value |",
+        "| --- | --- |",
+        f"| Lines read | {report.lines_read:,} |",
+        f"| Parsed | {report.parsed:,} ({report.parsed_ratio * 100:.1f}%) |",
+        f"| Unparseable | {report.unparseable:,} |",
+        f"| Error-keyword lines | {report.error_lines:,} |",
+        f"| Total bytes sent | {report.total_bytes:,} |",
+        "",
+    ]
+    if server_errors:
+        lines.append(f"> :warning: **{server_errors:,} server error(s) (5xx)** - investigate immediately.")
+    if client_errors:
+        lines.append(f"> :warning: {client_errors:,} client error(s) (4xx) - check for broken links or bad requests.")
+    if server_errors or client_errors:
+        lines.append("")
+
+    lines += ["## Status codes", "", "| Status | Count | Share |", "| --- | ---: | ---: |"]
+    for status, count in report.status_counts.most_common():
+        share = (count / report.parsed * 100) if report.parsed else 0.0
+        lines.append(f"| {status} | {count:,} | {share:.1f}% |")
+    lines.append("")
+
+    lines += _markdown_table(f"Top {top_n} client IPs", report.ip_counts, top_n)
+    lines += _markdown_table(f"Top {top_n} request paths", report.path_counts, top_n)
+    lines += _markdown_table(f"Top {top_n} methods", report.method_counts, top_n)
+
+    busiest = _busiest_hour(report)
+    if busiest:
+        lines.append(f"**Busiest hour:** {busiest['hour']:02d}:00 ({busiest['requests']:,} requests)")
+    return "\n".join(lines)
+
+
+FORMATTERS = {
+    "text": format_text,
+    "json": format_json,
+    "markdown": format_markdown,
+}
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the command-line interface."""
     parser = argparse.ArgumentParser(
@@ -294,6 +387,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=5,
         metavar="N",
         help="show the top N entries in each ranking (default: 5)",
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        choices=sorted(FORMATTERS),
+        default="text",
+        help="output format (default: text)",
     )
     parser.add_argument(
         "-o",
@@ -317,7 +417,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     report = analyze(paths)
-    output = format_text(report, top_n=args.top_n)
+    output = FORMATTERS[args.format](report, top_n=args.top_n)
 
     if args.output:
         Path(args.output).write_text(output + "\n", encoding="utf-8")
