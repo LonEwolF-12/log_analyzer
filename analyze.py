@@ -155,6 +155,126 @@ def iter_lines(paths: Iterable[Path]) -> Iterator[str]:
                     yield line
 
 
+@dataclass
+class Report:
+    """Aggregated statistics gathered from one analysis run."""
+
+    sources: list[str] = field(default_factory=list)
+    lines_read: int = 0
+    parsed: int = 0
+    unparseable: int = 0
+    error_lines: int = 0
+    total_bytes: int = 0
+    status_counts: Counter = field(default_factory=Counter)
+    method_counts: Counter = field(default_factory=Counter)
+    ip_counts: Counter = field(default_factory=Counter)
+    path_counts: Counter = field(default_factory=Counter)
+    hour_counts: Counter = field(default_factory=Counter)
+    user_agent_counts: Counter = field(default_factory=Counter)
+
+    @property
+    def parsed_ratio(self) -> float:
+        """Fraction of read lines that parsed successfully (0.0 - 1.0)."""
+        return self.parsed / self.lines_read if self.lines_read else 0.0
+
+    @property
+    def error_status_counts(self) -> tuple[int, int]:
+        """Return ``(client_errors, server_errors)`` for 4xx and 5xx statuses."""
+        client = sum(c for s, c in self.status_counts.items() if 400 <= s < 500)
+        server = sum(c for s, c in self.status_counts.items() if 500 <= s < 600)
+        return client, server
+
+
+def analyze(paths: Sequence[Path]) -> Report:
+    """Read every file in ``paths`` and build a :class:`Report`.
+
+    Lines are processed one at a time (streaming) so the tool's memory use does
+    not grow with the size of the input. Unparseable lines are counted rather
+    than raising, so a dirty log still produces a usable report.
+    """
+    report = Report(sources=[str(path) for path in paths])
+    for line in iter_lines(paths):
+        report.lines_read += 1
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in ERROR_KEYWORDS):
+            report.error_lines += 1
+
+        entry = parse_line(line)
+        if entry is None:
+            report.unparseable += 1
+            continue
+
+        report.parsed += 1
+        report.total_bytes += entry.size
+        report.status_counts[entry.status] += 1
+        report.method_counts[entry.method] += 1
+        report.ip_counts[entry.ip] += 1
+        report.path_counts[entry.path] += 1
+        report.user_agent_counts[entry.user_agent] += 1
+        if entry.timestamp is not None:
+            report.hour_counts[entry.timestamp.hour] += 1
+    return report
+
+
+REPORT_WIDTH = 70
+
+
+def _rule(char: str = "=") -> str:
+    return char * REPORT_WIDTH
+
+
+def _top_table(title: str, counter: Counter, top_n: int) -> list[str]:
+    """Render a ranked 'Top N' block for the given counter."""
+    rows = [f" {title}", f" {_rule('-')}"]
+    if not counter:
+        rows.append("   (none)")
+    for key, count in counter.most_common(top_n):
+        label = str(key) if str(key) else "(empty)"
+        rows.append(f"   {label[:44]:<44} {count:>8,}")
+    rows.append("")
+    return rows
+
+
+def format_text(report: Report, top_n: int = 5) -> str:
+    """Render the report as a human-readable text block."""
+    rows: list[str] = [
+        _rule("="),
+        " Log Analysis Report".center(REPORT_WIDTH),
+        _rule("="),
+        f" Sources          : {', '.join(report.sources)}",
+        f" Lines read       : {report.lines_read:,}",
+        f" Parsed           : {report.parsed:,} ({report.parsed_ratio * 100:.1f}%)",
+        f" Unparseable      : {report.unparseable:,}",
+        f" Error-keyword    : {report.error_lines:,}",
+        f" Total bytes sent : {report.total_bytes:,}",
+        "",
+    ]
+
+    rows.append(" Status codes")
+    rows.append(f" {_rule('-')}")
+    if not report.status_counts:
+        rows.append("   (none)")
+    for status, count in report.status_counts.most_common():
+        share = (count / report.parsed * 100) if report.parsed else 0.0
+        rows.append(f"   {status}  {count:>8,}  ({share:5.1f}%)")
+    client_errors, server_errors = report.error_status_counts
+    if server_errors:
+        rows.append(f"   !! {server_errors:,} server error(s) (5xx) - investigate immediately")
+    if client_errors:
+        rows.append(f"   !! {client_errors:,} client error(s) (4xx) - check for broken links / bad requests")
+    rows.append("")
+
+    rows += _top_table(f"Top {top_n} client IPs", report.ip_counts, top_n)
+    rows += _top_table(f"Top {top_n} request paths", report.path_counts, top_n)
+    rows += _top_table(f"Top {top_n} methods", report.method_counts, top_n)
+
+    if report.hour_counts:
+        hour, count = report.hour_counts.most_common(1)[0]
+        rows.append(f" Busiest hour     : {hour:02d}:00 - {count:,} request(s)")
+    rows.append(_rule("="))
+    return "\n".join(rows)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the command-line interface."""
     parser = argparse.ArgumentParser(
@@ -167,27 +287,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="log file(s), or directories containing *.log files",
     )
+    parser.add_argument(
+        "-n",
+        "--top-n",
+        type=int,
+        default=5,
+        metavar="N",
+        help="show the top N entries in each ranking (default: 5)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="write the report to FILE instead of stdout",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point. Returns the process exit code."""
     args = build_arg_parser().parse_args(argv)
+    if args.top_n < 1:
+        print("error: --top-n must be at least 1", file=sys.stderr)
+        return 2
     try:
         paths = resolve_paths(args.paths)
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    parsed = 0
-    unparseable = 0
-    for line in iter_lines(paths):
-        if parse_line(line) is None:
-            unparseable += 1
-        else:
-            parsed += 1
+    report = analyze(paths)
+    output = format_text(report, top_n=args.top_n)
 
-    print(f"parsed {parsed} line(s), {unparseable} could not be parsed")
+    if args.output:
+        Path(args.output).write_text(output + "\n", encoding="utf-8")
+        print(f"report written to {args.output}")
+    else:
+        print(output)
     return 0
 
 
